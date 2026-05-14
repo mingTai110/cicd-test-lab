@@ -1,0 +1,88 @@
+name: Security Scan
+
+on:
+  workflow_dispatch:
+    inputs:
+      languages:
+        description: 'CodeQL languages, comma-separated (auto|javascript|python|go|java|ruby|csharp|cpp)'
+        required: false
+        default: 'auto'
+        type: string
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '30 1 * * 0'  # Weekly — Sunday 01:30 UTC
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  detect-languages:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.detect.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect CodeQL languages
+        id: detect
+        run: |
+          input="${{ inputs.languages || 'auto' }}"
+          if [ "$input" = "auto" ]; then
+            langs=()
+            [ -f "package.json" ]                                              && langs+=("javascript")
+            { [ -f "requirements.txt" ] || [ -f "pyproject.toml" ]; }         && langs+=("python")
+            [ -f "go.mod" ]                                                    && langs+=("go")
+            { [ -f "pom.xml" ] || [ -f "build.gradle" ]; }                    && langs+=("java")
+            [ -f "Gemfile" ]                                                   && langs+=("ruby")
+            ls *.csproj 2>/dev/null                                            && langs+=("csharp") || true
+            [ ${#langs[@]} -eq 0 ]                                             && langs=("javascript")
+            input=$(IFS=,; echo "${langs[*]}")
+          fi
+          matrix=$(echo "$input" | tr ',' '\n' | jq -R -s -c 'split("\n") | map(select(length>0)) | {"language": .}')
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "### Security Scan — languages: \`$input\`" >> "$GITHUB_STEP_SUMMARY"
+
+  codeql:
+    needs: detect-languages
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.detect-languages.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-and-quality
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: '/language:${{ matrix.language }}'
+
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # full history needed for secret scanning
+
+      - name: Scan for secrets (Gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Report
+        if: always()
+        run: |
+          echo "### Secret Scan: ${{ job.status }}" >> "$GITHUB_STEP_SUMMARY"
